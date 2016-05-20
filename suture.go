@@ -355,6 +355,8 @@ Service is completely crashed.
 */
 type Service interface {
 	Serve()
+	Sync()
+	WakeUpSync()
 	Stop()
 }
 
@@ -407,7 +409,7 @@ func (s *Supervisor) Add(service Service) ServiceToken {
 // method does not return until it is safe to use .Add() on the Supervisor.
 func (s *Supervisor) ServeBackground() {
 	go s.Serve()
-	s.sync()
+	s.Sync()
 }
 
 /*
@@ -553,12 +555,23 @@ func (s *Supervisor) handleFailedService(id serviceID, err interface{}, stacktra
 }
 
 func (s *Supervisor) runService(service Service, id serviceID) {
+	// Maybe send two ended message. one normal, one crash
+	ended := make(chan serviceID, 1)
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
 				buf := make([]byte, 65535, 65535)
 				written := runtime.Stack(buf, false)
 				buf = buf[:written]
+
+				// If the service serve faild before ready to select
+				// .Sync() channel. .WakeUpSync() will to receive
+				// it. let blow .Sync() not block.
+				// If the service serve successfully.But crash on some time
+				// point. .WakeUpSync() will block a while and timeout.
+				//
+				service.WakeUpSync()
+				//ended <- id
 				s.fail(id, r, buf)
 			}
 		}()
@@ -567,6 +580,16 @@ func (s *Supervisor) runService(service Service, id serviceID) {
 
 		s.serviceEnded(id)
 	}()
+
+	// This call maybe block until service normal
+	go func() {
+		service.Sync()
+		ended <- id
+	}()
+
+	// block normal or faild.
+	// TODO: maybe add timeout
+	<-ended
 }
 
 func (s *Supervisor) removeService(id serviceID, removedChan chan supervisorMessage) {
@@ -686,8 +709,15 @@ type removeService struct {
 
 func (rs removeService) isSupervisorMessage() {}
 
-func (s *Supervisor) sync() {
+func (s *Supervisor) Sync() {
 	s.control <- syncSupervisor{}
+}
+
+func (s *Supervisor) WakeUpSync() {
+	select {
+	case <-s.control:
+	case <-s.getAfterChan(time.Millisecond * 1):
+	}
 }
 
 type syncSupervisor struct {
@@ -756,3 +786,10 @@ type panicSupervisor struct {
 }
 
 func (ps panicSupervisor) isSupervisorMessage() {}
+
+// Service sync
+
+type SyncService struct {
+}
+
+func (ss SyncService) isServiceMessage() {}
